@@ -70,7 +70,12 @@ int main() {
     
     // Default params matching C++ constructor defaults
     printf("Initializing VAD with model: %s\n", model_path);
-    constexpr int sample_rate = 16'000;
+    const int sample_rate = reader.sample_rate;
+    if (sample_rate != 8'000 && sample_rate != 16'000) {
+        fprintf(stderr, "Unsupported sample rate: %d (expected 8'000 or 16'000)\n", sample_rate);
+        wav_reader_close(&reader);
+        return EXIT_FAILURE;
+    }
     constexpr int window_ms = 32;
     if (!vad_iterator_init(&vad, model_path, sample_rate, window_ms, 0.5f, 100, 30, 250, INFINITY)) {
         fprintf(stderr, "Failed to initialize VAD\n");
@@ -83,7 +88,7 @@ int main() {
     vad_iterator_process(&vad, reader.data, reader.num_samples);
 
     // 4. Output Results
-    constexpr float sample_rate_float = 16'000.0f;
+    const float sample_rate_float = (float)sample_rate;
     constexpr char output_directory[] = "audio";
     size_t segment_index = 0;
 

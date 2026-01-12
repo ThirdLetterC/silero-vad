@@ -22,3 +22,5 @@ zig-out/
 
 onnxruntime-*
 silero_vad.onnx
+
+audio/

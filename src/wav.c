@@ -3,6 +3,17 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
+
+static float clamp_sample(float v) {
+    if (v > 1.0f) {
+        return 1.0f;
+    }
+    if (v < -1.0f) {
+        return -1.0f;
+    }
+    return v;
+}
 
 [[nodiscard]] 
 bool wav_reader_open(wav_reader_t* reader, const char* filename) {
@@ -224,21 +235,21 @@ bool wav_writer_write(const wav_writer_t* writer, const char* filename) {
     for (size_t i = 0; i < writer->num_samples; ++i) {
         for (int j = 0; j < writer->num_channel; ++j) {
             size_t idx = i * writer->num_channel + j;
-            const auto val = writer->data[idx];
+            const auto val = clamp_sample(writer->data[idx]);
             
             switch (writer->bits_per_sample) {
                 case 8: {
-                    char sample = (char)val;
+                    const auto sample = (uint8_t)lrintf((val + 1.0f) * 127.5f);
                     if (fwrite(&sample, 1, 1, fp) != 1) goto cleanup;
                     break;
                 }
                 case 16: {
-                    int16_t sample = (int16_t)val;
+                    const auto sample = (int16_t)lrintf(val * 32'767.0f);
                     if (fwrite(&sample, 2, 1, fp) != 1) goto cleanup;
                     break;
                 }
                 case 32: {
-                    int sample = (int)val;
+                    const auto sample = (int32_t)llrintf((double)val * 2'147'483'647.0);
                     if (fwrite(&sample, 4, 1, fp) != 1) goto cleanup;
                     break;
                 }

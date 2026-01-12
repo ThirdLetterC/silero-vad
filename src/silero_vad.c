@@ -374,10 +374,24 @@ void vad_iterator_process(vad_iterator_t* vad, const float* input_wav, size_t au
     }
 
     vad_iterator_reset_states(vad);
+
+    const size_t chunk = (size_t)vad->window_size_samples;
     
-    for (size_t j = 0; j < audio_length_samples; j += vad->window_size_samples) {
-        if (j + vad->window_size_samples > audio_length_samples) break;
+    size_t j = 0;
+    for (; j + chunk <= audio_length_samples; j += chunk) {
         vad_predict(vad, &input_wav[j]);
+    }
+
+    const size_t remaining = audio_length_samples - j;
+    if (remaining > 0U) {
+        auto padded = (float*)calloc(chunk, sizeof(float));
+        if (padded == nullptr) {
+            fprintf(stderr, "OOM while padding audio chunk\n");
+            return;
+        }
+        memcpy(padded, &input_wav[j], remaining * sizeof(float));
+        vad_predict(vad, padded);
+        free(padded);
     }
     
     if (vad->current_speech.start >= 0) {

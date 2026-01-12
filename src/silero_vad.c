@@ -3,61 +3,48 @@
     Translated from silero-vad-onnx.cpp.
 */
 
-#define _CRT_SECURE_NO_WARNINGS
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
 #include <float.h>
-#include <stdbool.h>
 #include <stdint.h>
 #include <stdckdint.h>
+#include <stddef.h>
 
+#include "silero_vad.h"
 #include "wav.h"
-#include <onnxruntime_c_api.h>
 
 /* --- Platform Specifics for ONNX Runtime --- */
-#ifdef _WIN32
-    #include <Windows.h>
-    typedef wchar_t ort_char_t;
-#else
-    typedef char ort_char_t;
-#endif
+typedef char ort_char_t;
 
 // Helper to convert char* path to ONNX compatible path
+[[nodiscard]]
 static ort_char_t* create_ort_path(const char* path) {
-#ifdef _WIN32
-    int len = MultiByteToWideChar(CP_UTF8, 0, path, -1, NULL, 0);
-    if (len <= 0) return nullptr;
-    wchar_t* wpath = (wchar_t*)malloc(len * sizeof(wchar_t));
-    MultiByteToWideChar(CP_UTF8, 0, path, -1, wpath, len);
-    return wpath;
-#else
-    return strdup(path);
-#endif
+    if (path == nullptr) {
+        return nullptr;
+    }
+
+    auto dup = strdup(path);
+    if (dup == nullptr) {
+        return nullptr;
+    }
+    return dup;
 }
 
 static void free_ort_path(ort_char_t* path) {
     free(path);
 }
 
+static bool is_16k_model(const char* path) {
+    if (path == nullptr) {
+        return false;
+    }
+    return strstr(path, "16k") != nullptr;
+}
+
 /* --- Constants --- */
 //#define DEBUG_SPEECH_PROB
-
-/* --- Data Structures --- */
-
-typedef struct {
-    int start;
-    int end;
-} timestamp_t;
-
-// Dynamic array for timestamps (replacing std::vector<timestamp_t>)
-typedef struct {
-    timestamp_t* data;
-    size_t size;
-    size_t capacity;
-} timestamp_vector_t;
 
 static void vec_init(timestamp_vector_t* vec) {
     vec->data = nullptr;
@@ -67,9 +54,10 @@ static void vec_init(timestamp_vector_t* vec) {
 
 static void vec_push(timestamp_vector_t* vec, timestamp_t ts) {
     if (vec->size >= vec->capacity) {
-        size_t new_cap = vec->capacity == 0 ? 8 : vec->capacity * 2;
-        timestamp_t* new_data = (timestamp_t*)realloc(vec->data, new_cap * sizeof(timestamp_t));
-        if (!new_data) {
+        constexpr size_t initial_capacity = 8;
+        const auto new_cap = vec->capacity == 0 ? initial_capacity : vec->capacity * 2;
+        auto new_data = (timestamp_t*)realloc(vec->data, new_cap * sizeof(timestamp_t));
+        if (new_data == nullptr) {
             fprintf(stderr, "OOM in vec_push\n");
             exit(EXIT_FAILURE);
         }
@@ -88,58 +76,9 @@ static void vec_clear(timestamp_vector_t* vec) {
     vec->size = 0;
 }
 
-/* --- VadIterator --- */
-
-typedef struct {
-    // ONNX Runtime Resources
-    const OrtApi* g_ort;
-    OrtEnv* env;
-    OrtSession* session;
-    OrtSessionOptions* session_options;
-    OrtMemoryInfo* memory_info;
-    OrtAllocator* allocator; // Default allocator
-
-    // Buffers and State
-    float* context;             // Holds 64 samples
-    float* state;               // Holds state tensor data (2 * 1 * 128)
-    int64_t* sr_tensor_data;    // Holds sample rate
-    
-    // Persistent Input/Output Buffers to avoid reallocation
-    float* input_buffer;        // effective_window_size
-    
-    // Configuration
-    int sample_rate;
-    int sr_per_ms;
-    int window_size_samples;
-    int effective_window_size;
-    int context_samples;
-    unsigned int size_state;
-
-    // Thresholds
-    float threshold;
-    int min_silence_samples;
-    int min_silence_samples_at_max_speech;
-    int min_speech_samples;
-    float max_speech_samples;
-    int speech_pad_samples;
-
-    // Logic State
-    bool triggered;
-    unsigned int temp_end;
-    unsigned int current_sample;
-    int prev_end;
-    int next_start;
-    
-    timestamp_t current_speech;
-    timestamp_vector_t speeches;
-
-} vad_iterator_t;
-
-/* --- VadIterator Implementation --- */
-
 // Check ONNX Status helper
 static void check_status(const OrtApi* g_ort, OrtStatus* status) {
-    if (status != NULL) {
+    if (status != nullptr) {
         const char* msg = g_ort->GetErrorMessage(status);
         fprintf(stderr, "ONNX Runtime Error: %s\n", msg);
         g_ort->ReleaseStatus(status);
@@ -148,12 +87,16 @@ static void check_status(const OrtApi* g_ort, OrtStatus* status) {
 }
 
 void vad_iterator_reset_states(vad_iterator_t* vad) {
+    if (vad == nullptr || vad->state == nullptr || vad->context == nullptr) {
+        return;
+    }
+
     memset(vad->state, 0, vad->size_state * sizeof(float));
     memset(vad->context, 0, vad->context_samples * sizeof(float));
     
     vad->triggered = false;
-    vad->temp_end = 0;
-    vad->current_sample = 0;
+    vad->temp_end = 0U;
+    vad->current_sample = 0U;
     vad->prev_end = 0;
     vad->next_start = 0;
     
@@ -161,28 +104,48 @@ void vad_iterator_reset_states(vad_iterator_t* vad) {
     vad->current_speech = (timestamp_t){-1, -1};
 }
 
-bool vad_iterator_init(vad_iterator_t* vad, const char* model_path, 
-                       int sample_rate, int window_frame_size_ms, 
-                       float threshold, int min_silence_ms, 
-                       int speech_pad_ms, int min_speech_ms, 
-                       float max_speech_s) 
+[[nodiscard]]
+bool vad_iterator_init(vad_iterator_t* vad, const char* model_path,
+                       int sample_rate, int window_frame_size_ms,
+                       float threshold, int min_silence_ms,
+                       int speech_pad_ms, int min_speech_ms,
+                       float max_speech_s)
 {
+    if (vad == nullptr || model_path == nullptr) {
+        return false;
+    }
+
     memset(vad, 0, sizeof(*vad));
     
     // 1. Setup API
     vad->g_ort = OrtGetApiBase()->GetApi(ORT_API_VERSION);
-    if (!vad->g_ort) {
+    if (vad->g_ort == nullptr) {
         fprintf(stderr, "Failed to init ONNX Runtime API\n");
         return false;
     }
 
     // 2. Constants & Sizes
+    const bool model_is_16k_only = is_16k_model(model_path);
+    if (model_is_16k_only && sample_rate != 16'000) {
+        fprintf(stderr, "Model at %s supports only 16'000 Hz\n", model_path);
+        return false;
+    }
+    if (!model_is_16k_only && sample_rate != 16'000 && sample_rate != 8'000) {
+        fprintf(stderr, "Supported sample rates: 8'000 or 16'000 Hz (got %d)\n", sample_rate);
+        return false;
+    }
+
+    const int context_samples = sample_rate == 16'000 ? 64 : 32;
+    constexpr unsigned int state_channels = 2U;
+    constexpr unsigned int state_batch = 1U;
+    constexpr unsigned int state_width = 128U;
+
     vad->sample_rate = sample_rate;
-    vad->sr_per_ms = sample_rate / 1000;
+    vad->sr_per_ms = sample_rate / 1'000;
     vad->window_size_samples = window_frame_size_ms * vad->sr_per_ms;
-    vad->context_samples = 64;
+    vad->context_samples = context_samples;
     vad->effective_window_size = vad->window_size_samples + vad->context_samples;
-    vad->size_state = 2 * 1 * 128;
+    vad->size_state = state_channels * state_batch * state_width;
     
     vad->threshold = threshold;
     vad->min_silence_samples = vad->sr_per_ms * min_silence_ms;
@@ -192,25 +155,37 @@ bool vad_iterator_init(vad_iterator_t* vad, const char* model_path,
     vad->min_silence_samples_at_max_speech = vad->sr_per_ms * 98;
 
     // 3. Allocate Buffers
-    vad->context = (float*)calloc(vad->context_samples, sizeof(float));
-    vad->state = (float*)calloc(vad->size_state, sizeof(float));
-    vad->sr_tensor_data = (int64_t*)malloc(sizeof(int64_t));
-    *vad->sr_tensor_data = sample_rate;
-    vad->input_buffer = (float*)malloc(vad->effective_window_size * sizeof(float));
-    
+    vad->context = (float*)calloc((size_t)vad->context_samples, sizeof(float));
+    vad->state = (float*)calloc((size_t)vad->size_state, sizeof(float));
+    vad->sr_tensor_data = (int64_t*)calloc(1, sizeof(int64_t));
+    vad->input_buffer = (float*)calloc((size_t)vad->effective_window_size, sizeof(float));
     vec_init(&vad->speeches);
     vad->current_speech = (timestamp_t){-1, -1};
+
+    if (vad->context == nullptr || vad->state == nullptr || vad->sr_tensor_data == nullptr || vad->input_buffer == nullptr) {
+        vad_iterator_free(vad);
+        return false;
+    }
+
+    *vad->sr_tensor_data = sample_rate;
 
     // 4. Setup ONNX Env & Session
     check_status(vad->g_ort, vad->g_ort->CreateEnv(ORT_LOGGING_LEVEL_WARNING, "SileroVAD", &vad->env));
     check_status(vad->g_ort, vad->g_ort->CreateSessionOptions(&vad->session_options));
-    
-    vad->g_ort->SetIntraOpNumThreads(vad->session_options, 1);
-    vad->g_ort->SetInterOpNumThreads(vad->session_options, 1);
-    vad->g_ort->SetSessionGraphOptimizationLevel(vad->session_options, ORT_ENABLE_ALL);
+
+    constexpr int ort_thread_count = 1;
+    const auto g = vad->g_ort;
+    const auto opts = vad->session_options;
+
+    check_status(g, g->SetIntraOpNumThreads(opts, ort_thread_count));
+    check_status(g, g->SetInterOpNumThreads(opts, ort_thread_count));
+    check_status(g, g->SetSessionGraphOptimizationLevel(opts, ORT_ENABLE_ALL));
 
     ort_char_t* ort_path = create_ort_path(model_path);
-    if (!ort_path) return false;
+    if (ort_path == nullptr) {
+        vad_iterator_free(vad);
+        return false;
+    }
     
     check_status(vad->g_ort, vad->g_ort->CreateSession(vad->env, ort_path, vad->session_options, &vad->session));
     free_ort_path(ort_path);
@@ -221,23 +196,43 @@ bool vad_iterator_init(vad_iterator_t* vad, const char* model_path,
 }
 
 void vad_iterator_free(vad_iterator_t* vad) {
-    if (!vad->g_ort) return;
-    
-    if (vad->session) vad->g_ort->ReleaseSession(vad->session);
-    if (vad->session_options) vad->g_ort->ReleaseSessionOptions(vad->session_options);
-    if (vad->env) vad->g_ort->ReleaseEnv(vad->env);
-    if (vad->memory_info) vad->g_ort->ReleaseMemoryInfo(vad->memory_info);
+    if (vad == nullptr) {
+        return;
+    }
 
+    if (vad->g_ort != nullptr) {
+        if (vad->session != nullptr) vad->g_ort->ReleaseSession(vad->session);
+        if (vad->session_options != nullptr) vad->g_ort->ReleaseSessionOptions(vad->session_options);
+        if (vad->env != nullptr) vad->g_ort->ReleaseEnv(vad->env);
+        if (vad->memory_info != nullptr) vad->g_ort->ReleaseMemoryInfo(vad->memory_info);
+        vad->session = nullptr;
+        vad->session_options = nullptr;
+        vad->env = nullptr;
+        vad->memory_info = nullptr;
+        vad->g_ort = nullptr;
+    }
+    
     free(vad->context);
     free(vad->state);
     free(vad->sr_tensor_data);
     free(vad->input_buffer);
+    vad->context = nullptr;
+    vad->state = nullptr;
+    vad->sr_tensor_data = nullptr;
+    vad->input_buffer = nullptr;
     vec_free(&vad->speeches);
 }
 
 // Core inference logic
 static void vad_predict(vad_iterator_t* vad, const float* data_chunk) {
-    const OrtApi* g = vad->g_ort;
+    if (vad == nullptr || data_chunk == nullptr) {
+        return;
+    }
+
+    const auto g = vad->g_ort;
+    if (g == nullptr || vad->memory_info == nullptr || vad->session == nullptr) {
+        return;
+    }
 
     // 1. Prepare Input Buffer: [Context (64)] + [Chunk (WindowSize)]
     memcpy(vad->input_buffer, vad->context, vad->context_samples * sizeof(float));
@@ -270,7 +265,7 @@ static void vad_predict(vad_iterator_t* vad, const float* data_chunk) {
     // 4. Get Outputs
     float* output_data = nullptr;
     check_status(g, g->GetTensorMutableData(outputs[0], (void**)&output_data));
-    float speech_prob = output_data[0];
+    const auto speech_prob = output_data[0];
 
     float* stateN_data = nullptr;
     check_status(g, g->GetTensorMutableData(outputs[1], (void**)&stateN_data));
@@ -304,7 +299,6 @@ static void vad_predict(vad_iterator_t* vad, const float* data_chunk) {
         }
         
         // Update context: Last 64 samples of current buffer
-        // In C++: copy(new_data.end() - context_samples, ...)
         memcpy(vad->context, vad->input_buffer + (vad->effective_window_size - vad->context_samples), vad->context_samples * sizeof(float));
         return;
     }
@@ -371,6 +365,14 @@ static void vad_predict(vad_iterator_t* vad, const float* data_chunk) {
 }
 
 void vad_iterator_process(vad_iterator_t* vad, const float* input_wav, size_t audio_length_samples) {
+    if (vad == nullptr || input_wav == nullptr) {
+        return;
+    }
+
+    if (vad->window_size_samples == 0) {
+        return;
+    }
+
     vad_iterator_reset_states(vad);
     
     for (size_t j = 0; j < audio_length_samples; j += vad->window_size_samples) {
@@ -387,50 +389,4 @@ void vad_iterator_process(vad_iterator_t* vad, const float* input_wav, size_t au
         vad->temp_end = 0;
         vad->triggered = false;
     }
-}
-
-/* --- Main --- */
-
-int main(void) {
-    // 1. Read WAV
-    const char* input_file = "audio/recorder.wav";
-    wav_reader_t reader;
-    
-    printf("Loading WAV file: %s\n", input_file);
-    if (!wav_reader_open(&reader, input_file)) {
-        return EXIT_FAILURE;
-    }
-
-    // 2. Init VAD
-    // Note: C23 auto/constexpr usage not critical here, keeping plain C types for clarity
-    const char* model_path = "model/silero_vad.onnx";
-    vad_iterator_t vad;
-    
-    // Default params matching C++ constructor defaults
-    printf("Initializing VAD with model: %s\n", model_path);
-    if (!vad_iterator_init(&vad, model_path, 16000, 32, 0.5f, 100, 30, 250, INFINITY)) {
-        fprintf(stderr, "Failed to initialize VAD\n");
-        wav_reader_close(&reader);
-        return EXIT_FAILURE;
-    }
-
-    // 3. Process
-    printf("Processing %zu samples...\n", reader.num_samples);
-    vad_iterator_process(&vad, reader.data, reader.num_samples);
-
-    // 4. Output Results
-    const float sample_rate_float = 16000.0f;
-    for (size_t i = 0; i < vad.speeches.size; i++) {
-        timestamp_t ts = vad.speeches.data[i];
-        float start_sec = rintf((ts.start / sample_rate_float) * 10.0f) / 10.0f;
-        float end_sec = rintf((ts.end / sample_rate_float) * 10.0f) / 10.0f;
-        
-        printf("Speech detected from %.1f s to %.1f s\n", start_sec, end_sec);
-    }
-
-    // 5. Cleanup
-    vad_iterator_free(&vad);
-    wav_reader_close(&reader);
-
-    return EXIT_SUCCESS;
 }

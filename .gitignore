@@ -1,0 +1,24 @@
+# Zig build artifacts
+zig-cache/
+zig-out/
+.zig-cache/
+
+# Editor/OS
+*.swp
+*.swo
+.DS_Store
+
+# VS Code
+.vscode/
+
+# Build outputs
+*.o
+*.obj
+*.exe
+*.dll
+*.so
+*.a
+*.lib
+
+onnxruntime-*
+silero_vad.onnx

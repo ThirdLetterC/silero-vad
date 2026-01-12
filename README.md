@@ -9,8 +9,8 @@ Real-time Silero VAD demo in strict C23 with ONNX Runtime C API.
 
 ## Build
 ```sh
-zig build \\
-  -Dort-include=/path/to/onnxruntime/include \\
+zig build \
+  -Dort-include=/path/to/onnxruntime/include \
   -Dort-lib=/path/to/onnxruntime/lib
 ```
 Flags default to system paths if not provided.

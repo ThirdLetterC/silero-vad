@@ -43,3 +43,6 @@ zig build \
 - `src/`: library sources and CLI (`silero_vad.c`, `wav.c`, `main.c`)
 - `build.zig`: Zig-based build script targeting `-std=c23` with strict warnings
 - `justfile`: convenience tasks (`just install`, `just run`, `just fmt`)
+
+## License
+MIT. See `LICENSE` for details.
